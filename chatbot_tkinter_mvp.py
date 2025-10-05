@@ -23,43 +23,54 @@ except OSError:
         nlp = spacy.load("es_core_news_md")
         messagebox.showinfo("Éxito", "Modelo de spaCy descargado e cargado exitosamente.")
     except Exception as e:
-        messagebox.showerror("Error", f"No se pudo descargar ni cargar el modelo de spaCy: {e}. Asegúrate de tener conexión a internet y de que el modelo esté disponible.")
         nlp = None # Indicar que el modelo no está disponible
 
 # Palabras que queremos conservar (normalizadas)
 custom_stopwords_to_keep = {"no", "si", "donde", "cuando", "como", "que", "cual", "cuanto"}
 
 def normalize_text(text):
-    if not nlp: # Si el modelo de spaCy no se cargó, retornar el texto sin normalizar
-        return text.lower()
+    """
+    Normaliza el texto para procesamiento, manteniendo caracteres especiales del español.
+    
+    Args:
+        text (str): Texto a normalizar
+        
+    Returns:
+        str: Texto normalizado en minúsculas, sin signos de puntuación ni espacios extra,
+             manteniendo caracteres especiales del español (ñ, tildes, etc.)
+    """
+    if not text or not isinstance(text, str):
+        return ""
+        
+    # Si el modelo de spaCy no está disponible, hacer una normalización básica
+    if not nlp:
+        # Convertir a minúsculas
+        text = text.lower()
+        # Eliminar signos de puntuación (excepto guiones y apóstrofes dentro de palabras)
+        text = re.sub(r'(?<![\w\-\'])[^\w\s\-\']+|[^\w\s\-\']+(?![\w\-\'])', ' ', text)
+        # Eliminar espacios extra
+        return ' '.join(text.split())
 
-    # Paso 1: Convertir a minúsculas
+    # Convertir a minúsculas
     text = text.lower()
-
-    # Paso 2: Eliminar tildes y ñ
-    text = unicodedata.normalize("NFD", text)
-    text = text.encode("ascii", "ignore").decode("utf-8")  # elimina tildes y ñ
-
-    # Paso 3: Eliminar signos de puntuación
-    text = re.sub(r"[^\w\s]", "", text)
-
-    # Paso 4: Eliminar espacios extra
-    text = re.sub(r"\s+", " ", text).strip()
-
-    # Paso 5: Procesar con spaCy
+    
+    # Normalizar caracteres Unicode (combinar caracteres acentuados)
+    text = unicodedata.normalize("NFC", text)
+    
+    # Procesar con spaCy
     doc = nlp(text)
-
-    # Paso 6: Lematizar, eliminar stopwords y quitar tildes también a los lemas
+    
+    # Filtrar y lematizar tokens
     tokens = [
-        ''.join(
-            c for c in unicodedata.normalize("NFD", token.lemma_)
-            if unicodedata.category(c) != 'Mn'
-        )
+        token.lemma_
         for token in doc
         if not (token.is_stop and token.lemma_.lower() not in custom_stopwords_to_keep)
+        and not token.is_punct
+        and not token.is_space
     ]
-
-    return " ".join(tokens)
+    
+    # Unir tokens en un solo string
+    return ' '.join(tokens)
 
 class ChatbotApp:
     def __init__(self, master):
@@ -106,6 +117,17 @@ class ChatbotApp:
             df = pd.read_csv(filename)
             print(f"  ✓ Dataset principal cargado con éxito")
             print(f"  - Número de registros: {len(df)}")
+            
+            # Validar columnas requeridas en el dataset principal
+            required_columns = ['pregunta', 'respuesta_compuesta', 'categoria']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            
+            if missing_columns:
+                error_msg = f"El dataset principal no tiene las columnas requeridas: {', '.join(missing_columns)}"
+                print(f"  ❌ {error_msg}")
+                messagebox.showerror("Error", error_msg)
+                return None
+            
             if len(df) > 0:
                 print(f"  - Columnas disponibles: {', '.join(df.columns)}")
                 print(f"  - Categorías únicas: {df['categoria'].nunique()}")
@@ -114,11 +136,11 @@ class ChatbotApp:
             # Cargar los otros conjuntos de datos
             print("\n[2/4] Cargando datasets adicionales...")
             
-            print("\n  - Dataset de ubicación (datos_ubicacion.csv):")
-            self.df_ubicacion = self._load_additional_data("datos_ubicacion.csv")
+            print("\n  - Dataset de ubicación (departamentos.csv):")
+            self.df_ubicacion = self._load_additional_data("departamentos_600.csv")
             
-            print("\n  - Dataset numérico (chatbot_data_numerico.csv):")
-            self.df_numerico = self._load_additional_data("chatbot_data_numerico.csv")
+            print("\n  - Dataset numérico (chatbot_data_optimizado.csv):")
+            self.df_numerico = self._load_additional_data("chatbot_data_optimizado.csv")
             
             print("\n  - Dataset complejo (datos_complejos.csv):")
             self.df_complejo = self._load_additional_data("datos_complejos.csv")
@@ -267,8 +289,20 @@ class ChatbotApp:
         print("Tipo: General (ninguna categoría específica detectada)")
         return 'general'
     
-    def get_best_match(self, query, df, dataset_name=""):
-        """Encuentra la mejor coincidencia en el dataframe dado."""
+    def get_best_match(self, query, df, dataset_name="", return_match_info=False):
+        """
+        Encuentra la mejor coincidencia en el dataframe usando búsqueda semántica y por palabras clave.
+        
+        Args:
+            query: La pregunta del usuario
+            df: DataFrame con las preguntas y respuestas
+            dataset_name: Nombre del dataset para logging
+            return_match_info: Si es True, retorna un diccionario con información detallada
+            
+        Returns:
+            Si return_match_info es False: La mejor respuesta encontrada o None
+            Si return_match_info es True: Un diccionario con información detallada de la mejor coincidencia
+        """
         print(f"\nBuscando en el dataset: {dataset_name or 'general'}")
         
         if df is None:
@@ -279,6 +313,78 @@ class ChatbotApp:
             print("  - El dataset está vacío")
             return None
             
+        # Hacer una copia del dataframe para no modificar el original
+        df = df.copy()
+        
+        # 1. Primero intentar búsqueda exacta o por palabras clave
+        query_lower = query.lower()
+        palabras_clave = [p for p in query_lower.split() if len(p) > 3]  # Filtrar palabras muy cortas
+        
+        # Buscar coincidencias exactas o parciales en las columnas relevantes
+        columnas_busqueda = ['pregunta', 'respuesta', 'respuesta_compuesta', 'categoria']
+        columnas_busqueda = [c for c in columnas_busqueda if c in df.columns]
+        
+        # Crear máscara de coincidencias
+        mascara = pd.Series(False, index=df.index)
+        for col in columnas_busqueda:
+            for palabra in palabras_clave:
+                # Buscar la palabra en cada celda (ignorando mayúsculas/minúsculas)
+                mascara = mascara | df[col].str.contains(palabra, case=False, na=False, regex=False)
+        
+        # Si encontramos coincidencias exactas, procesarlas
+        if mascara.any():
+            df_coincidencias = df[mascara].copy()
+            print(f"  - Se encontraron {len(df_coincidencias)} coincidencias por palabras clave")
+            
+            # Si hay múltiples coincidencias, ordenar por relevancia
+            if len(df_coincidencias) > 0:
+                # Contar el número de palabras clave que coinciden
+                def contar_coincidencias(serie):
+                    return serie.apply(lambda x: sum(1 for p in palabras_clave if p in str(x).lower()))
+                
+                # Usar map en lugar de applymap (que está obsoleto)
+                df_coincidencias['puntaje'] = df_coincidencias[columnas_busqueda].apply(contar_coincidencias).sum(axis=1)
+                df_coincidencias = df_coincidencias.sort_values('puntaje', ascending=False)
+                
+                # Filtrar respuestas que contengan "NO INDICA" en cualquier campo relevante
+                columnas_verificar = ['respuesta_compuesta', 'respuesta', 'pregunta', 'departamento', 'municipio']
+                columnas_verificar = [c for c in columnas_verificar if c in df_coincidencias.columns]
+                
+                # Crear máscara para excluir filas con "NO INDICA" en cualquier campo relevante
+                mascara_no_indica = pd.Series(False, index=df_coincidencias.index)
+                for col in columnas_verificar:
+                    mascara_no_indica = mascara_no_indica | df_coincidencias[col].str.contains('NO INDICA', case=False, na=False)
+                
+                # Filtrar las coincidencias
+                sin_no_indica = df_coincidencias[~mascara_no_indica]
+                
+                # Si después de filtrar aún hay coincidencias, usarlas
+                if not sin_no_indica.empty:
+                    print(f"  - Se encontraron {len(sin_no_indica)} coincidencias válidas después de filtrar 'NO INDICA'")
+                    df_coincidencias = sin_no_indica
+                else:
+                    print("  - Todas las coincidencias contienen 'NO INDICA' en algún campo relevante")
+                    return None
+                
+            if len(df_coincidencias) > 0:
+                mejor_idx = df_coincidencias.index[0]
+                mejor_row = df_coincidencias.iloc[0]
+            else:
+                print("  - No hay coincidencias válidas después de filtrar")
+                return None
+            
+            if return_match_info:
+                return {
+                    'answer': mejor_row.get('respuesta_compuesta', mejor_row.get('respuesta', 'Sin respuesta')),
+                    'similarity': 1.0,  # Máxima similitud para coincidencias exactas
+                    'question': mejor_row.get('pregunta', ''),
+                    'dataset': dataset_name
+                }
+            return mejor_row.get('respuesta_compuesta', mejor_row.get('respuesta', 'Sin respuesta'))
+        
+        # 2. Si no hay coincidencias exactas, usar búsqueda semántica
+        print("  - No se encontraron coincidencias exactas, intentando búsqueda semántica...")
+        
         # Normalizar la pregunta del usuario
         pregunta_limpia = normalize_text(query)
         if not pregunta_limpia:
@@ -287,51 +393,75 @@ class ChatbotApp:
             
         print(f"  - Pregunta normalizada: '{pregunta_limpia}'")
         
-        # Vectorizar la pregunta del usuario y las preguntas del dataset
-        vectorizer = self.model.named_steps["tfidfvectorizer"]
         try:
-            pregunta_vec = vectorizer.transform([pregunta_limpia])
+            # Vectorizar la pregunta del usuario
+            vectorizer = self.model.named_steps["tfidfvectorizer"]
             
-            # Calcular similitud con todas las preguntas en el dataset
-            similitudes = []
-            for idx, row in df.iterrows():
-                pregunta_dataset = normalize_text(row['pregunta'] if 'pregunta' in row else '')
-                if not pregunta_dataset:
-                    continue
-                    
-                # Vectorizar la pregunta del dataset
-                pregunta_dataset_vec = vectorizer.transform([pregunta_dataset])
-                
-                # Calcular similitud del coseno
-                similitud = cosine_similarity(pregunta_vec, pregunta_dataset_vec)[0][0]
-                similitudes.append((similitud, idx, row))
+            # Asegurarse de que todas las preguntas estén normalizadas
+            df["pregunta_limpia"] = df["pregunta"].apply(
+                lambda x: normalize_text(str(x)) if pd.notna(x) else ""
+            )
             
-            if not similitudes:
-                print("  - No se encontraron preguntas para comparar")
+            # Filtrar preguntas vacías
+            df = df[df["pregunta_limpia"] != ""]
+            
+            if df.empty:
+                print("  - No hay preguntas válidas para comparar")
                 return None
                 
-            # Ordenar por similitud descendente
-            similitudes.sort(reverse=True, key=lambda x: x[0])
+            # Vectorizar todas las preguntas del dataset de una vez
+            preguntas_vec = vectorizer.transform(df["pregunta_limpia"])
+            pregunta_vec = vectorizer.transform([pregunta_limpia])
             
-            # Imprimir las 3 mejores coincidencias
-            print("  - Mejores coincidencias:")
-            for i, (sim, idx, row) in enumerate(similitudes[:3]):
-                print(f"    {i+1}. Similitud: {sim*100:.1f}% - '{row.get('pregunta', '')[:100]}{'...' if len(str(row.get('pregunta', ''))) > 100 else ''}")
+            # Calcular similitud con todas las preguntas
+            similitudes = cosine_similarity(pregunta_vec, preguntas_vec)[0]
             
-            # Retornar la mejor coincidencia si supera el umbral
-            mejor_sim, mejor_idx, mejor_row = similitudes[0]
-            if mejor_sim >= 0.6:  # 60% de similitud
-                print(f"  ✓ Mejor coincidencia seleccionada con {mejor_sim*100:.1f}% de similitud")
-                return mejor_row.get('respuesta_compuesta', 'Respuesta no disponible')
+            # Encontrar la mejor coincidencia, ignorando las que contengan "NO INDICA"
+            mejor_idx = -1
+            mejor_similitud = 0
+            mejor_row = None
+            
+            # Buscar la mejor coincidencia que no contenga "NO INDICA"
+            for i in range(len(similitudes)):
+                if similitudes[i] > mejor_similitud:
+                    row = df.iloc[i]
+                    respuesta = str(row.get('respuesta_compuesta', row.get('respuesta', '')))
+                    if 'NO INDICA' not in respuesta.upper():
+                        mejor_similitud = similitudes[i]
+                        mejor_idx = i
+                        mejor_row = row
+            
+            # Si no se encontró ninguna coincidencia sin "NO INDICA", usar la mejor disponible
+            if mejor_idx == -1 and len(similitudes) > 0:
+                print("  - Todas las coincidencias contienen 'NO INDICA', mostrando la mejor coincidencia")
+                mejor_idx = similitudes.argmax()
+                mejor_similitud = similitudes[mejor_idx]
+                mejor_row = df.iloc[mejor_idx]
+            
+            if mejor_row is not None:
+                print(f"  - Mejor coincidencia: {mejor_similitud*100:.1f}% de similitud")
+                
+                if return_match_info:
+                    return {
+                        'answer': mejor_row.get('respuesta_compuesta', 'Respuesta no disponible'),
+                        'similarity': float(mejor_similitud),
+                        'question': mejor_row.get('pregunta', ''),
+                        'dataset': dataset_name
+                    }
+                elif mejor_similitud >= 0.4:  # 40% de similitud
+                    return mejor_row.get('respuesta_compuesta', 'Respuesta no disponible')
+                else:
+                    print(f"  ✗ La mejor coincidencia no supera el umbral del 40% ({mejor_similitud*100:.1f}%)")
+                    return None
             else:
-                print(f"  ✗ Ninguna coincidencia superó el umbral del 60% (mejor: {mejor_sim*100:.1f}%)")
+                print("  - No se encontraron coincidencias válidas")
+                return None
                 
         except Exception as e:
             print(f"  ✗ Error al buscar coincidencia: {e}")
             import traceback
             traceback.print_exc()
-            
-        return None
+            return None
     
     def get_chatbot_response(self, query):
         print("\n" + "="*120)
@@ -352,150 +482,75 @@ class ChatbotApp:
         if despedidas_encontradas:
             print(f"Despedida detectada: {despedidas_encontradas}")
             return random.choice(self.respuestas_despedida)
-            
-        # Determinar el tipo de pregunta
-        question_type = self.get_question_type(query)
         
-        # Seleccionar el conjunto de datos adecuado
-        if question_type == 'ubicacion':
-            print("\nBuscando en dataset de ubicación...")
-            if self.df_ubicacion is not None:
-                respuesta = self.get_best_match(query, self.df_ubicacion, "ubicación")
-                if respuesta:
-                    return respuesta
-                print("  - No se encontró una respuesta adecuada en el dataset de ubicación")
-            else:
-                print("  - Dataset de ubicación no disponible")
-                
-        elif question_type == 'numerico':
-            print("\nBuscando en dataset numérico...")
-            if self.df_numerico is not None:
-                respuesta = self.get_best_match(query, self.df_numerico, "numérico")
-                if respuesta:
-                    return respuesta
-                print("  - No se encontró una respuesta adecuada en el dataset numérico")
-            else:
-                print("  - Dataset numérico no disponible")
-                
-        elif question_type == 'complejo':
-            print("\nBuscando en dataset de preguntas complejas...")
-            if self.df_complejo is not None:
-                respuesta = self.get_best_match(query, self.df_complejo, "complejo")
-                if respuesta:
-                    return respuesta
-                print("  - No se encontró una respuesta adecuada en el dataset de preguntas complejas")
-            else:
-                print("  - Dataset de preguntas complejas no disponible")
-                
-        # Si no se encontró una respuesta en los conjuntos específicos o no superó el umbral,
-        # intentar con el conjunto general
+        # Lista de conjuntos de datos a buscar, en orden de prioridad
+        datasets = [
+            (self.df, "principal"),
+            (self.df_ubicacion, "ubicación"),
+            (self.df_numerico, "numérico"),
+            (self.df_complejo, "complejo")
+        ]
+        
+        # Primero, intentar con el dataset específico según el tipo de pregunta
+        question_type = self.get_question_type(query)
+        if question_type == 'ubicacion' and self.df_ubicacion is not None:
+            datasets.insert(1, (self.df_ubicacion, "ubicación"))
+        elif question_type == 'numerico' and self.df_numerico is not None:
+            datasets.insert(1, (self.df_numerico, "numérico"))
+        elif question_type == 'complejo' and self.df_complejo is not None:
+            datasets.insert(1, (self.df_complejo, "complejo"))
+        
+        # Eliminar duplicados manteniendo el orden
+        seen = set()
+        unique_datasets = []
+        for df, name in datasets:
+            if df is not None and not any(df.equals(existing_df) for existing_df, _ in unique_datasets):
+                unique_datasets.append((df, name))
+        datasets = unique_datasets
+        
+        # Mostrar información de búsqueda
         print("\n" + "-"*80)
-        print("🔍 BUSCANDO EN EL DATASET GENERAL (chatbot_datav5.csv)")
+        print("🔍 INICIANDO BÚSQUEDA EN DATASETS")
+        print(f"  - Datasets disponibles: {', '.join([name for df, name in datasets])}")
         print("-"*80)
-        try:
-            print(f"  - Total de respuestas disponibles: {len(self.df)}")
-            print(f"  - Columnas disponibles: {', '.join(self.df.columns)}")
-            if 'categoria' in self.df.columns:
-                print(f"  - Categorías disponibles: {', '.join(self.df['categoria'].unique().tolist())}")
+        
+        # Buscar en todos los datasets y guardar los resultados
+        all_matches = []
+        
+        for df, nombre in datasets:
+            print(f"\nBuscando en dataset {nombre}...")
+            if df is not None and not df.empty:
+                print(f"  - Total de registros: {len(df)}")
+                if 'categoria' in df.columns:
+                    print(f"  - Categorías disponibles: {df['categoria'].nunique()}")
                 
-            # Mostrar estadísticas de las preguntas
-            if not self.df.empty:
-                longitudes = self.df['pregunta'].str.len()
-                print(f"  - Longitud promedio de preguntas: {longitudes.mean():.1f} caracteres")
-                print(f"  - Pregunta más corta: '{self.df.loc[longitudes.idxmin(), 'pregunta']}'")
-                print(f"  - Pregunta más larga: '{self.df.loc[longitudes.idxmax(), 'pregunta']}'")
-                
-                # Mostrar ejemplos de preguntas
-                print("\n  Ejemplos de preguntas en el dataset:")
-                for i, q in enumerate(self.df.sample(min(3, len(self.df)))['pregunta'].tolist(), 1):
-                    print(f"    {i}. {q[:100]}{'...' if len(q) > 100 else ''}")
-                print()
-            # Normalizar la pregunta del usuario
-            pregunta_limpia = normalize_text(query)
-            if not pregunta_limpia:
-                print("  - No se pudo normalizar la pregunta")
-                return "No pude procesar tu pregunta. ¿Podrías intentar con otras palabras?"
-
-            print(f"  - Pregunta normalizada: '{pregunta_limpia}'")
-
-            # Clasificar la intención (categoría) usando el modelo Naive Bayes
-            try:
-                etiqueta_predicha = self.model.predict([pregunta_limpia])[0]
-                print(f"  - Categoría predicha: '{etiqueta_predicha}'")
-            except Exception as e:
-                print(f"  ✗ Error al predecir la categoría: {e}")
-                return "Hubo un problema al entender la categoría de tu pregunta. Por favor, intenta de nuevo."
-            
-            # Filtrar respuestas de esa categoría
-            respuestas_categoria = self.df[self.df["categoria"] == etiqueta_predicha].copy()
-            print(f"  - Se encontraron {len(respuestas_categoria)} respuestas en la categoría")
-
-            if respuestas_categoria.empty:
-                print(f"  - No hay respuestas en la categoría '{etiqueta_predicha}'")
-                return f"No encontré información específica para la categoría '{etiqueta_predicha}'. Intenta con otra pregunta."
-
-            # Vectorizar y encontrar la mejor coincidencia
-            vectorizer = self.model.named_steps["tfidfvectorizer"]
-            pregunta_vec = vectorizer.transform([pregunta_limpia])
-            
-            # Vectorizar respuestas
-            respuestas_categoria["respuesta_vec"] = respuestas_categoria["respuesta_compuesta_limpia"].apply(
-                lambda x: vectorizer.transform([x]) if pd.notna(x) else None
-            )
-            
-            # Filtrar valores nulos
-            respuestas_categoria = respuestas_categoria[respuestas_categoria["respuesta_vec"].notna()]
-            
-            if respuestas_categoria.empty:
-                print("  - No se pudo vectorizar ninguna respuesta")
-                return "No pude encontrar una respuesta adecuada. ¿Podrías reformular tu pregunta?"
-                
-            # Calcular similitud
-            print("  - Calculando similitudes...")
-            respuestas_categoria["similitud"] = respuestas_categoria["respuesta_vec"].apply(
-                lambda x: float(cosine_similarity(x, pregunta_vec)[0][0]) if x is not None else 0.0
-            )
-            
-            # Ordenar por similitud
-            respuestas_categoria = respuestas_categoria.sort_values("similitud", ascending=False)
-            
-            # Mostrar las 3 mejores coincidencias
-            print("\n  Mejores coincidencias encontradas:")
-            for i, (_, row) in enumerate(respuestas_categoria.head(3).iterrows(), 1):
-                print(f"  {i}. Similitud: {row['similitud']*100:.1f}% - '{row.get('pregunta', '')[:80]}{'...' if len(str(row.get('pregunta', ''))) > 80 else ''}")
-            
-            # Obtener la mejor respuesta con al menos 60% de similitud
-            mejor_idx = respuestas_categoria["similitud"].idxmax()
-            mejor_similitud = respuestas_categoria.loc[mejor_idx, "similitud"]
-            
-            print(f"\n  Mejor coincidencia: {mejor_similitud*100:.1f}% de similitud")
-            
-            if mejor_similitud >= 0.6:  # 60% de similitud
-                return respuestas_categoria.loc[mejor_idx, "respuesta_compuesta"]
+                # Obtener la mejor coincidencia de este dataset
+                best_match = self.get_best_match(query, df, nombre, return_match_info=True)
+                if best_match and best_match['similarity'] > 0:  # Solo considerar coincidencias con similitud > 0
+                    all_matches.append(best_match)
+                    print(f"  - Mejor coincidencia en {nombre}: {best_match['similarity']*100:.1f}%")
+                else:
+                    print(f"  - No se encontraron coincidencias útiles en el dataset {nombre}")
             else:
-                print(f"  ✗ La mejor coincidencia no supera el umbral del 60% ({mejor_similitud*100:.1f}%)")
-                
-                # Si la mejor coincidencia tiene al menos 40% de similitud, sugerir posibles respuestas
-                if mejor_similitud >= 0.1:
-                    posibles_respuestas = respuestas_categoria.head(3)
-                    sugerencias = [
-                        f"- {row['pregunta']}" 
-                        for _, row in posibles_respuestas.iterrows()
-                    ]
-                    return (
-                        "No estoy seguro de entender completamente tu pregunta. "
-                        "¿Te refieres a alguna de estas opciones?\n\n" +
-                        "\n".join(sugerencias[:3]) + 
-                        "\n\nPor favor, reformula tu pregunta para ser más específico."
-                    )
-                
-                return "No encontré una respuesta lo suficientemente precisa. ¿Podrías ser más específico o reformular tu pregunta?"
-                
-        except Exception as e:
-            print(f"\n  ✗ Error al procesar la pregunta: {e}")
-            import traceback
-            traceback.print_exc()
-            return "Lo siento, hubo un error al procesar tu pregunta. Por favor, inténtalo de nuevo."
+                print(f"  - Dataset {nombre} está vacío o no disponible")
+        
+        # Seleccionar la mejor coincidencia de todos los datasets
+        if all_matches:
+            # Ordenar por similitud descendente
+            all_matches.sort(key=lambda x: x['similarity'], reverse=True)
+            best_overall = all_matches[0]
+            
+            print("\n" + "="*80)
+            print(f"🏆 MEJOR COINCIDENCIA GLOBAL ({best_overall['dataset']} - {best_overall['similarity']*100:.1f}%)")
+            print("="*80)
+            print(f"Pregunta: {best_overall['question']}")
+            print(f"Respuesta: {best_overall['answer']}")
+            print("="*80 + "\n")
+            return best_overall['answer']
+        
+        # Si llegamos aquí, no se encontró ninguna respuesta adecuada
+        print("\n⚠️ No se encontró una respuesta adecuada en ningún dataset")
+        return "Lo siento, no tengo suficiente información para responder a tu pregunta. ¿Podrías reformularla o proporcionar más detalles?"
 
     def display_message(self, message, sender):
         self.chat_history.config(state=tk.NORMAL)

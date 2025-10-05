@@ -1,0 +1,8 @@
+# Dependencias para chatbot_tkinter_mvp.py
+pandas==1.5.3
+numpy==1.24.3
+scikit-learn==1.3.0
+spacy==3.7.2
+
+# Modelo de spaCy (instalar con: python -m spacy download es_core_news_md)
+# es_core_news_md
